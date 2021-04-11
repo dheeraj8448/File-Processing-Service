@@ -1,0 +1,169 @@
+---
+- name: Deploys the whole software stack for a CakePHP application
+  hosts: development
+  user: vagrant
+  vars:
+    docker_apps:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+    docker_apps_desired_state: present
+    docker_service_name: docker
+    docker_service_desired_state: restarted
+    docker_service_desired_boot_enabled: yes
+    docker_group: docker
+    docker_group_desired_state: present
+    docker_user: docker
+    docker_user_home: "/home/{{ docker_user }}"
+    docker_user_shell: /bin/bash
+    docker_user_desired_state: present
+
+    docker_ubuntu_pre_reqs_desired_state: present
+    docker_repo_ubuntu_gpg_key: https://download.docker.com/linux/ubuntu/gpg
+    docker_repo_ubuntu: "deb [arch={{ ansible_architecture }}] https://download.docker.com/linux/ubuntu {{ ansible_lsb['codename'] }} stable"
+    docker_repo_ubuntu_when_x86_64: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_lsb['codename'] }} stable"
+    docker_repo_ubuntu_filename: docker-ce
+    docker_repo_ubuntu_desired_state: present
+  vars:
+    # Edition can be one of: 'ce' (Community Edition) or 'ee' (Enterprise Edition).
+    docker_edition: 'ce'
+    docker_package: "docker-{{ docker_edition }}"
+    docker_package_state: present
+
+    # Service options.
+    docker_service_state: started
+    docker_service_enabled: true
+    docker_restart_handler_state: restarted
+
+    # Docker Compose options.
+    docker_install_compose: true
+    docker_compose_version: "1.26.0"
+    docker_compose_url: https://github.com/docker/compose/releases/download/{{ docker_compose_version }}/docker-compose-Linux-x86_64
+    docker_compose_path: /usr/local/bin/docker-compose
+
+    docker_repo_url: https://download.docker.com/linux
+    docker_apt_release_channel: stable
+    docker_apt_arch: amd64
+    docker_apt_repository: "deb [arch={{ docker_apt_arch }}] {{ docker_repo_url }}/{{ ansible_distribution | lower }} {{ ansible_distribution_release }} {{ docker_apt_release_channel }}"
+    docker_apt_ignore_key_error: true
+    docker_apt_gpg_key: "{{ docker_repo_url }}/{{ ansible_distribution | lower }}/gpg"
+
+    # A list of users who will be added to the docker group.
+    docker_users: ['vagrant', 'root']
+
+
+  handlers:
+    - name: restart docker
+      service: "name=docker state={{ docker_restart_handler_state }}"
+
+  tasks:
+    - block:
+      - name: Update apt-get repo and cache
+        apt: update_cache=yes force_apt_get=yes cache_valid_time=3600
+
+      - apt:
+          state: latest
+          name: python-pip
+
+      - name: Ensure old versions of Docker are not installed.
+        package:
+          name:
+            - docker
+            - docker-engine
+            - python-backports.ssl-match-hostname
+          state: absent
+
+      - name: Ensure dependencies are installed.
+        apt:
+          name:
+            - apt-transport-https
+            - ca-certificates
+            - linux-generic-lts-xenial
+            - lsb-release
+            - software-properties-common
+            - inotify-tools
+            - gzip
+          state: present
+
+      - name: Ensure additional dependencies are installed (on Ubuntu < 20.04 and any other systems).
+        apt:
+          name: gnupg2
+          state: present
+        when: ansible_distribution != 'Ubuntu' or ansible_distribution_version is version('20.04', '<')
+
+      - name: Ensure additional dependencies are installed (on Ubuntu >= 20.04).
+        apt:
+          name: gnupg
+          state: present
+        when: ansible_distribution == 'Ubuntu' or ansible_distribution_version is version('20.04', '>=')
+
+      - name: Add Docker apt key.
+        apt_key:
+          url: "{{ docker_apt_gpg_key }}"
+          id: 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+          state: present
+        register: add_repository_key
+        ignore_errors: "{{ docker_apt_ignore_key_error }}"
+
+      - name: Ensure curl is present (on older systems without SNI).
+        package: name=curl state=present
+        when: add_repository_key is failed
+
+      - name: Add Docker apt key (alternative for older systems without SNI).
+        shell: >
+          curl -sSL {{ docker_apt_gpg_key }} | sudo apt-key add -
+        args:
+          warn: false
+        when: add_repository_key is failed
+
+      - name: Add Docker repository.
+        apt_repository:
+          repo: "{{ docker_apt_repository }}"
+          state: present
+          update_cache: true
+
+      - name: Install Docker.
+        package:
+          name: "{{ docker_package }}"
+          state: "{{ docker_package_state }}"
+        notify: restart docker
+
+      - name: Ensure Docker is started and enabled at boot.
+        service:
+          name: docker
+          state: "{{ docker_service_state }}"
+          enabled: "{{ docker_service_enabled }}"
+      
+      - name: Check current docker-compose version.
+        command: "{{ docker_compose_path }} --version"
+        register: docker_compose_current_version
+        changed_when: false
+        failed_when: false
+
+      - name: Delete existing docker-compose version if it's different.
+        file:
+          path: "{{ docker_compose_path }}"
+          state: absent
+        when: >
+          docker_compose_current_version.stdout is defined
+          and docker_compose_version not in docker_compose_current_version.stdout
+
+      - name: Install Docker Compose (if configured).
+        get_url:
+          url: "{{ docker_compose_url }}"
+          dest: "{{ docker_compose_path }}"
+          mode: 0755
+          validate_certs: no
+        when: >
+          docker_compose_current_version.stdout is not defined
+          or docker_compose_version not in docker_compose_current_version.stdout
+
+      - command: service docker restart 
+
+      - name: Build Docker image from Dockerfile
+        command: docker-compose -f /vagrant/docker-compose.yaml build 
+
+      - name: Running the container
+        command: docker-compose -f /vagrant/docker-compose.yaml up -d 
+
+      become: true
